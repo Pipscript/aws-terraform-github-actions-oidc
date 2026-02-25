@@ -3,24 +3,25 @@ name: Trigger on pull_request (plan) and merge_group (apply) events with Terrafo
 on:
     pull_request:
         branches: [main]
-        paths: [terraform/**, .github/workflows/terraform-TF-via-PR]
+        paths: [terraform/**, .github/workflows/terraform-TF-via-PR.yml]
         types: [opened, synchronize, reopened]
 
     merge_group:
         types: [checks_requested]
 
 env:
-    AWS_ACCOUNT:
-    AWS_REGION:
-    PLAN_ROLE:
-    APPLY_ROLE:
+    AWS_REGION: ${{ vars.AWS_REGION }}
+    PLAN_ROLE: ${{ vars.TERRAFORM_PLAN_AWS_ROLE_ARN }}
+    APPLY_ROLE: ${{ vars.TERRAFORM_APPLY_AWS_ROLE_ARN }}
+    WORKING_DIRECTORY: terraform/
 
 jobs:
-    terrafrom:
+    terraform:
+        timeout-minutes: 30
         runs-on: ubuntu-24.04
         defaults:
             run:
-                working-directory: terraform/
+                working-directory: ${{env.WORKING_DIRECTORY}}
 
         permissions:
             contents: read # Required to checkout repository.
@@ -30,44 +31,173 @@ jobs:
             pull-requests: write # Required to add PR comment and label.
             security-events: write # Required for checkov
 
-        environment:
+        environment: ${{ github.event_name == 'merge_group' && 'production' || '' }}
 
         concurrency:
-            # All merge_group runs share the group <workflow>-apply, so they queue and never race on state.
+            # All merge_group runs share the group, so they queue and never race on state.
             # Combined with cancel-in-progress: false, a second apply will wait rather than get cancelled.
             cancel-in-progress: false
             group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && 'apply' || github.ref }}
 
         steps:
-            # Job that notifies the slack channel on failure
+            - name: Checkout PR
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  persist-credentials: false # prevents leaking the GH token to subsequent steps
 
-            # 1. Checkout repository (disable persist-credentials)
+            - name: Gitleaks
+              if: ${{github.event_name == 'pull_request' || 'push'}}
+              uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-            # 2. Auth with AWS (dynamic switch: merge_group → Apply role, else Plan role)
+            - name: Authenticate AWS
+              uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+              with:
+                  aws-region: ${{vars.AWS_REGION}}
+                  role-to-assume: >-
+                      ${{github.event_name == 'merge_group' && env.APPLY_ROLE || env.PLAN_ROLE }}
+                  role-session-name: gha-${{github.run_id}}-${{github.run_attempt}}-${{github.actor_id}}
 
-            # 3. Verify AWS identity (aws sts get-caller-identity)
+            - name: Verify AWS credentials
+              run: aws sts get-caller-identity
 
-            # 4. Setup TF (hashicorp/setup-terraform, terraform_wrapper: false for TF-via-PR)
+            - name: Create cache directory
+              run: |
+                  mkdir --parents $HOME/.terraform.d/plugin-cache
+                  echo "TF_PLUGIN_CACHE_DIR=$HOME/.terraform.d/plugin-cache" >> $GITHUB_ENV
 
-            # 5. TFLint  (PR only)
-            #    setup-tflint + tflint --init + tflint --recursive
-            #    Run this BEFORE TF-via-PR so linting gates the plan
+            - name: Cache TF
+              uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+              with:
+                  path: ~/.terraform.d/plugin-cache
+                  key: cache-tf-${{ runner.os }}-${{ hashFiles('terraform/.terraform.lock.hcl') }}
+                  restore-keys: |
+                      cache-tf-${{ runner.os }}-
 
-            # 6. Checkov Static Analysis — EXPLICIT STEP (PR only)
-            #    Run after TFLint, before provisioning
+            - name: Setup TF
+              uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
+              with:
+                  terraform_wrapper: false
 
-            # 7. Cache TF providers (actions/cache on ~/.terraform.d/plugin-cache)
+            - name: Setup TFLint
+              if: ${{github.event_name == 'pull_request'}}
+              uses: terraform-linters/setup-tflint@4cb9feea73331a35b422df102992a03a44a3bb33 # v6.2.1
+              with:
+                  cache: true
+                  tflint_wrapper: true
 
-            # 8. Provision TF with TF-via-PR
-            #    ↳ This internally handles: init → fmt check → validate → plan/apply
-            #    fmt, init, validate do NOT need separate steps
+            - name: Run TFLint
+              id: tflint
+              if: ${{ github.event_name == 'pull_request' }}
+              working-directory: ${{env.WORKING_DIRECTORY}}
+              env:
+                  # https://github.com/terraform-linters/tflint/blob/master/docs/user-guide/plugins.md#avoiding-rate-limiting
 
-            # 9. Troubleshoot TF on error with AI (on: failure)
+                  GITHUB_TOKEN: ${{ github.token }}
+              run: |
+                  tflint --init
+                  tflint --recursive --format compact >> tflint_report.txt || true
+              continue-on-error: true
 
-            # 10. [Rollback logic — only on apply failure in merge_group]
+            - name: Checkov Static Analysis
+              id: checkov
+              if: ${{github.event_name == 'pull_request'}}
+              uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
+              with:
+                  directory: ${{env.WORKING_DIRECTORY}}
+                  framework: terraform
+                  output_format: cli,sarif
+                  output_file_path: console,results.sarif
+              continue-on-error: true
 
-            #  11. Clear directory — the workspace currently has the failed branch's code. You can't just checkout over it cleanly in all cases, so nuke it first.
+            - name: Upload SARIF file
+              if: ${{github.event_name == 'pull_request'}}
+              uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
+              with:
+                  sarif_file: results.sarif
+                  category: checkov
 
-            # Checkout main — get the last known-good config.
+            - name: Provision TF
+              id: tfProvision
+              uses: op5dev/tf-via-pr@5a4229041e3c90818d85813d4e4a4d44f653d5e9 # v13.7.2
+              with:
+                  working-directory: terraform/
+                  tool: terraform
+                  command: ${{github.event_name == 'merge_group' && 'apply' || 'plan'}}
+                  format: true
+                  validate: true
+                  arg-lock-timeout: 3m
+                  arg-lock: ${{ github.event_name == 'merge_group' }}
+                  plan-encrypt: ${{secrets.TF_ENCRYPTION}}
+                  arg-backend-config: |
+                      bucket=${{ secrets.AWS_S3_TERRAFORM_BACKEND }}
+                      key=${{ vars.STATEFILE_KEY }}
+                      region=${{ vars.AWS_REGION }}
+                      encrypt=true
+                      use_lockfile=true
+                  plan-parity: true
+                  retention-days: 2
+                  expand-diff: true
+                  tag-actor: never
 
-            # Rollback TF — run apply with arg-auto-approve: true against main, which drives infrastructure back to the state that main describes.
+            - name: Extract TF errors
+              if: ${{ failure() && github.event_name == 'merge_group' }}
+              id: extract
+              shell: bash
+              env:
+                  # Pass data via ENV to prevent Shell Injection
+                  RAW_RESULT: ${{ steps.tfProvision.outputs.result }}
+              run: |
+                  # Filter specifically for Terraform error blocks
+                  CLEAN_ERRORS=$(echo "$RAW_RESULT" | grep -E "^(Error|╷|│|╵|Error:)" | head -30)
+
+                  # Use multiline delimiter for GITHUB_OUTPUT
+                  EOF=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+                  echo "result<<$EOF" >> $GITHUB_OUTPUT
+                  echo "$CLEAN_ERRORS" >> $GITHUB_OUTPUT
+                  echo "$EOF" >> $GITHUB_OUTPUT
+
+            - name: Troubleshoot TF
+              if: ${{ failure() && github.event_name == 'merge_group' }}
+              uses: op5dev/prompt-ai@4cacb93e4a1e101f3a89650b31a3582321f2461d # v2.0.0
+              with:
+                  model: openai/gpt-4.1-mini
+                  system-prompt: |
+                      You are a DevOps expert and helpful DevOps assistant and expert at troubleshooting Terraform errors.
+                      Analyze the Terraform error below. 
+                      Provide a concise explanation and a specific fix. 
+                      Redact any sensitive IDs or tokens in your response.
+                  user-prompt: "Terraform failed with these errors:\n\n${{ steps.extract.outputs.result }}"
+                  max-tokens: 500
+
+            - name: Clear directory
+              if: ${{failure() && github.event_name == 'merge_group' }}
+              run: find ${{github.workspace}} -mindepth 1 -delete
+
+            - name: Checkout main
+              if: ${{failure() && github.event_name == 'merge_group'}}
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  persist-credentials: false
+                  ref: main
+
+            - name: TF Rollback
+              if: ${{failure() && github.event_name == 'merge_group'}}
+              uses: op5dev/tf-via-pr@5a4229041e3c90818d85813d4e4a4d44f653d5e9 # v13.7.2
+              with:
+                  working-directory: ${{env.WORKING_DIRECTORY}}
+                  tool: terraform
+                  comment-pr: never
+                  command: apply
+                  arg-auto-approve: true
+                  arg-lock-timeout: 3m
+                  arg-lock: true
+                  arg-backend-config: |
+                      bucket=${{ secrets.AWS_S3_TERRAFORM_BACKEND }}
+                      key=${{ vars.STATEFILE_KEY }}
+                      region=${{ vars.AWS_REGION }}
+                      encrypt=true
+                      use_lockfile=true
+
+        # TODO: Add job that notifies the team about the failure via email
