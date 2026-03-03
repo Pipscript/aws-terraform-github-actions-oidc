@@ -15,10 +15,14 @@ env:
     APPLY_ROLE: ${{ vars.TERRAFORM_APPLY_AWS_ROLE_ARN }}
     WORKING_DIRECTORY: terraform/
 
+permissions:
+    contents: read
+
 jobs:
     terraform:
         timeout-minutes: 30
         runs-on: ubuntu-24.04
+        if: github.event.pull_request.head.repo.full_name == github.repository
         defaults:
             run:
                 working-directory: ${{env.WORKING_DIRECTORY}}
@@ -29,13 +33,11 @@ jobs:
             checks: write # Required to add status summary.
             actions: read # Required to download artifact.
             pull-requests: write # Required to add PR comment and label.
-            security-events: write # Required for checkov
-
-        environment: ${{ github.event_name == 'merge_group' && 'production' || '' }}
+            security-events: write # Upload SARIF to GitHub Security tab.
+        environment: ${{ github.event_name == 'merge_group' && 'production' }}
 
         concurrency:
-            # All merge_group runs share the group, so they queue and never race on state.
-            # Combined with cancel-in-progress: false, a second apply will wait rather than get cancelled.
+            # All merge_group runs share one group so they queue, never race on state.
             cancel-in-progress: false
             group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && 'apply' || github.ref }}
 
@@ -43,10 +45,11 @@ jobs:
             - name: Checkout PR
               uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
               with:
-                  persist-credentials: false # prevents leaking the GH token to subsequent steps
+                  persist-credentials: false # No GH token leaked to child processes.
 
             - name: Gitleaks
-              if: ${{github.event_name == 'pull_request' || 'push'}}
+              id: gitleaks
+              if: ${{github.event_name == 'pull_request'}}
               uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -57,6 +60,7 @@ jobs:
                   aws-region: ${{vars.AWS_REGION}}
                   role-to-assume: >-
                       ${{github.event_name == 'merge_group' && env.APPLY_ROLE || env.PLAN_ROLE }}
+                  role-duration-seconds: 900
                   role-session-name: gha-${{github.run_id}}-${{github.run_attempt}}-${{github.actor_id}}
 
             - name: Verify AWS credentials
@@ -80,6 +84,27 @@ jobs:
               with:
                   terraform_wrapper: false
 
+            - name: Verify provider lock integrity
+              id: providerLock
+              if: ${{ github.event_name == 'pull_request' }}
+              run: |
+                  terraform init -backend=false -input=false
+
+                  terraform providers lock \
+                    -platform=linux_amd64 \
+                    -platform=linux_arm64 \
+                    -platform=darwin_amd64 \
+                    -platform=darwin_arm64 \
+                    -platform=windows_amd64
+
+                  # Any diff means the committed lock file is out of sync
+                  if ! git diff --exit-code .terraform.lock.hcl; then
+                    echo "::error::.terraform.lock.hcl is out of sync or has been tampered with."
+                    echo "Run 'terraform providers lock' locally and commit the updated file."
+                    exit 1
+                  fi
+                  echo "Provider lock file integrity confirmed."
+
             - name: Setup TFLint
               if: ${{github.event_name == 'pull_request'}}
               uses: terraform-linters/setup-tflint@4cb9feea73331a35b422df102992a03a44a3bb33 # v6.2.1
@@ -90,17 +115,17 @@ jobs:
             - name: Run TFLint
               id: tflint
               if: ${{ github.event_name == 'pull_request' }}
-              working-directory: ${{env.WORKING_DIRECTORY}}
+              continue-on-error: true
               env:
                   # https://github.com/terraform-linters/tflint/blob/master/docs/user-guide/plugins.md#avoiding-rate-limiting
 
                   GITHUB_TOKEN: ${{ github.token }}
               run: |
                   tflint --init
-                  tflint --recursive --format compact >> tflint_report.txt || true
-              continue-on-error: true
+                  set -o pipefail
+                  tflint --recursive --format compact 2>&1 | tee /tmp/tflint_report.txt
 
-            - name: Checkov Static Analysis
+            - name: Checkov static scan
               id: checkov
               if: ${{github.event_name == 'pull_request'}}
               uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
@@ -108,15 +133,14 @@ jobs:
                   directory: ${{env.WORKING_DIRECTORY}}
                   framework: terraform
                   output_format: cli,sarif
-                  output_file_path: console,results.sarif
-              continue-on-error: true
+                  output_file_path: console,/tmp/results-static.sarif
 
             - name: Upload SARIF file
               if: ${{github.event_name == 'pull_request'}}
               uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
               with:
-                  sarif_file: results.sarif
-                  category: checkov
+                  sarif_file: /tmp/results-static.sarif
+                  category: checkov-static
 
             - name: Provision TF
               id: tfProvision
@@ -141,35 +165,43 @@ jobs:
                   expand-diff: true
                   tag-actor: never
 
-            - name: Extract TF errors
-              if: ${{ failure() && github.event_name == 'merge_group' }}
-              id: extract
-              shell: bash
-              env:
-                  # Pass data via ENV to prevent Shell Injection
-                  RAW_RESULT: ${{ steps.tfProvision.outputs.result }}
+            - name: Install Checkov for TF Plan
+              if: ${{ github.event_name == 'pull_request' }}
               run: |
-                  # Filter specifically for Terraform error blocks
-                  CLEAN_ERRORS=$(echo "$RAW_RESULT" | grep -E "^(Error|╷|│|╵|Error:)" | head -30)
+                  pip install \
+                  --require-hashes \
+                  --no-deps \
+                  -r .github/requirements.txt \
+                  --break-system-packages
 
-                  # Use multiline delimiter for GITHUB_OUTPUT
-                  EOF=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
-                  echo "result<<$EOF" >> $GITHUB_OUTPUT
-                  echo "$CLEAN_ERRORS" >> $GITHUB_OUTPUT
-                  echo "$EOF" >> $GITHUB_OUTPUT
+            - name: Export plan to JSON
+              id: planJson
+              if: ${{ github.event_name == 'pull_request' }}
+              run: |
+                  terraform show -json "${{ steps.tfProvision.outputs.plan-file }}" | jq > tfplan.json
 
-            - name: Troubleshoot TF
-              if: ${{ failure() && github.event_name == 'merge_group' }}
-              uses: op5dev/prompt-ai@4cacb93e4a1e101f3a89650b31a3582321f2461d # v2.0.0
+            - name: Checkov TF plan scan
+              id: checkov_plan
+              if: ${{ github.event_name == 'pull_request' }}
+              continue-on-error: true
+              run: |
+                  checkov \
+                    --file tfplan.json \
+                    --framework terraform_plan \
+                    --repo-root-for-plan-enrichment \
+                        "${{ github.workspace }}/${{ env.WORKING_DIRECTORY }}" \
+                    --deep-analysis \
+                    --output cli \
+                    --output sarif \
+                    --output-file-path console,/tmp/results-plan.sarif \
+                    --hard-fail-on HIGH,CRITICAL
+
+            - name: Upload plan SARIF
+              if: ${{ github.event_name == 'pull_request'}}
+              uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
               with:
-                  model: openai/gpt-4.1-mini
-                  system-prompt: |
-                      You are a DevOps expert and helpful DevOps assistant and expert at troubleshooting Terraform errors.
-                      Analyze the Terraform error below. 
-                      Provide a concise explanation and a specific fix. 
-                      Redact any sensitive IDs or tokens in your response.
-                  user-prompt: "Terraform failed with these errors:\n\n${{ steps.extract.outputs.result }}"
-                  max-tokens: 500
+                  sarif_file: /tmp/results-plan.sarif
+                  category: checkov-plan
 
             - name: Clear directory
               if: ${{failure() && github.event_name == 'merge_group' }}
@@ -201,3 +233,4 @@ jobs:
                       use_lockfile=true
 
         # TODO: Add job that notifies the team about the failure via email
+        # TODO: Post comments to PR
